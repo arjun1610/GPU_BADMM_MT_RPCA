@@ -25,26 +25,17 @@ typedef struct ADMM_para
     float* iter_err;
     unsigned int MAX_ITER;          // MAX_ITER
     float tol;
-    float abstol;
-    float reltol;
-    float lambda;
-
 }ADMM_para;
 
 typedef struct BADMM_massTrans
 {
     int m;
     int n;
-    int N;
 
-    // we'll call our matrix A
-    float* A;                       // row major order
+    float* C;                       // row major order
     float* a;
     float* b;
 
-    float g2;
-    float g3;
-    
     int print_step;
 
     bool SAVEFILE;
@@ -58,68 +49,59 @@ All matrices are in row major order
 **********************************************/
 void gpuBADMM_MT( BADMM_massTrans* &badmm_mt, ADMM_para* &badmmpara, GPUInfo* gpu_info)
 {
-    float *X_1, *X_2, *X_3, *U, *B;     // host (boyd code)
+    float *X, *Z, *Y;                   // host
 
-    float *d_A, *d_X_1, *d_X_2, *d_X_3, *d_U, *d_B;     // device
+    float *d_C, *d_X, *d_Z, *d_Y;       // device
+    float *d_a, *d_b;
 
+    float *d_Xold, *d_Yerr;             // for stopping condition
+    float Xerr, Yerr;
 
-    float *z;             // for stopping condition
-
-    // Needed ????
     float *d_rowSum, *d_colSum;         // for row and column normalization
     float *col_ones, *row_ones;
 
-    unsigned int m,n,N;
+    unsigned int m,n;
     m = badmm_mt->m;
     n = badmm_mt->n;
-    N = badmm_mt->N;
 
     unsigned long int size = m*n;
 
     // initialize host matrix
-    X_1 = new float[size];
-    X_2 = new float[size];
-    X_3 = new float[size];
-    U = new float[size];
-    B = new float[size];
-    z = new float[size*N];
+    X = new float[size];
+    Z = new float[size];
+    Y = new float[size];
 
-    matInit(X_1,size,0.0);
-    matInit(X_2,size,0.0);
-    matInit(X_3,size,0.0);
+    matInit(X,size,0.0);
     matInit(Z,size,1.0/n);
     matInit(Y,size,0.0);
 
-    // local variables below for updates
-    // set g2_max = norm(A(:), inf);
-    // set g3_max = norm(A);
-
-    // THEN UNCOMMENT
-    // badmm_mt->g2 = 0.15 * g2_max;
-    // badmm_mt->g3 = 0.15 * g3_max;
-    // Let's hard code correct values from boyd for now
-    badmm_mt->g2 = 0.14999999999; 
-    badmm_mt->g3 = 206.356410537;
-
     // GPU matrix
-    cudaMalloc(&d_A, size*sizeof(float));
-    cudaMalloc(&d_X_1, size*sizeof(float));
-    cudaMalloc(&d_X_2, size*sizeof(float));
-    cudaMalloc(&d_X_3, size*sizeof(float));
-    cudaMalloc(&d_U, size*sizeof(float));
-    cudaMalloc(&d_B, size*sizeof(float));
+    cudaMalloc(&d_C, size*sizeof(float));
+    cudaMalloc(&d_X, size*sizeof(float));
+    cudaMalloc(&d_Z, size*sizeof(float));
+    cudaMalloc(&d_Y, size*sizeof(float));
 
     printf("Copying data from CPU to GPU ...\n");
 
     // copy to GPU
-    cudaMemcpy(d_A, badmm_mt->A, sizeof(float)*size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_X_1, X_1, sizeof(float)*size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_X_2, X_2, sizeof(float)*size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_X_3, X_3, sizeof(float)*size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_U, U, sizeof(float)*size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, B, sizeof(float)*size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_C, badmm_mt->C, sizeof(float)*size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_X, X, sizeof(float)*size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_Z, Z, sizeof(float)*size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_Y, Y, sizeof(float)*size, cudaMemcpyHostToDevice);
 
+    if (badmm_mt->a)
+    {
+        cudaMalloc(&d_a, m*sizeof(float));
+        cudaMemcpy(d_a, badmm_mt->a, sizeof(float)*m, cudaMemcpyHostToDevice);
+    }
 
+    if (badmm_mt->b)
+    {
+        cudaMalloc(&d_b, m*sizeof(float));
+        cudaMemcpy(d_b, badmm_mt->b, sizeof(float)*n, cudaMemcpyHostToDevice);
+    }
+
+    cudaMalloc(&d_Xold, size*sizeof(float));
 
 /*  only support integer
     cudaMemset(d_X,0.0,size*sizeof(float));
@@ -131,7 +113,6 @@ void gpuBADMM_MT( BADMM_massTrans* &badmm_mt, ADMM_para* &badmmpara, GPUInfo* gp
     unsigned int block_size = size > gpu_info->MAX_BLOCK_SIZE ? gpu_info->MAX_BLOCK_SIZE : size;
     unsigned long int n_blocks = (int) (size+block_size-1)/block_size;
     if(n_blocks > gpu_info->MAX_GRID_SIZE) n_blocks = gpu_info->MAX_GRID_SIZE;
-    printf("Block size %f b_blocks %f\n", block_size, n_blocks);
 
     unsigned int stride = block_size*n_blocks;
 
@@ -302,8 +283,7 @@ int main(const int argc, const char **argv)
 
     badmm_mt->print_step = 0;           // default: not print
     badmm_mt->SAVEFILE = 1;             // default: save
-    // we'll call it A
-    badmm_mt->A = NULL;
+    badmm_mt->C = NULL;
     badmm_mt->a = NULL;
     badmm_mt->b = NULL;
 
@@ -326,7 +306,7 @@ int main(const int argc, const char **argv)
     char filename[40];
     FILE *f;
 
-    // read A
+    // read C
     sprintf(filename, "%dC.dat",dim);
 
 	printf("%s", filename);
@@ -340,18 +320,14 @@ int main(const int argc, const char **argv)
     fread(Asize,sizeof(int),2, f);
     badmm_mt->m = Asize[0];
     badmm_mt->n = Asize[1];
-    badmm_mt->N = 3; 
     size = badmm_mt->m*badmm_mt->n;
-    badmm_mt->A = new float[size];
-    fread (badmm_mt->A,sizeof(float),size,f);
+    badmm_mt->C = new float[size];
+    fread (badmm_mt->C,sizeof(float),size,f);
     fclose(f);
 
     printf("Cost Matrix C: rows = %d, cols = %d, total size = %d\n", badmm_mt->m, badmm_mt->n, size);
 
 
-
-    // DONT NEED FOR RPCA
-    // DELETE ALL
     // read a
     sprintf(filename, "%da.dat",dim);
 	f = fopen ( filename , "rb" );
@@ -371,8 +347,6 @@ int main(const int argc, const char **argv)
         fread (badmm_mt->b,sizeof(float),badmm_mt->n,f);
         fclose(f);
     }
-    // UNTIL HERE
-
 
     int iter_size;
 
@@ -381,12 +355,9 @@ int main(const int argc, const char **argv)
     badmm_para = (struct ADMM_para *) malloc( sizeof(struct ADMM_para) );
 
     // default value
-    badmm_para->lambda = 1;
-    badmm_para->rho = 1.0 / badmm_para->lambda;
-    badmm_para->MAX_ITER = 100;
+    badmm_para->rho = 0.001;
+    badmm_para->MAX_ITER = 2000;
     badmm_para->tol = 1e-4;
-    badmm_para->abstol = 1e-4;
-    badmm_para->reltol = 1e-2;
 
     if ( argc > 2 ) badmm_para->rho = strtod(argv[2],&str);
     if ( argc > 3 ) badmm_para->MAX_ITER = strtol(argv[3],&str,10);
@@ -434,7 +405,7 @@ int main(const int argc, const char **argv)
     delete[]badmm_para->iter_obj;
     delete[]badmm_para->iter_time;
     free(badmm_para);
-    if(badmm_mt->A)delete[]badmm_mt->A;
+    if(badmm_mt->C)delete[]badmm_mt->C;
     if(badmm_mt->a)delete[]badmm_mt->a;
     if(badmm_mt->b)delete[]badmm_mt->b;
     free(badmm_mt);

@@ -94,3 +94,16 @@ if use_cvx
     fprintf('X_1: %.2e; X_2: %.2e; X_3: %.2e\n', ...
         norm(h.X1_cvx - X_1,'fro'), norm(h.X2_cvx - X_2,'fro'), norm(h.X3_cvx - X_3,'fro'));
 end
+
+function x = avg(varargin)
+    N = length(varargin);
+    x = 0;
+    for k = 1:N
+        x = x + varargin{k};
+    end
+    x = x/N;
+end
+
+function p = objective(X_1, g_2, X_2, g_3, X_3)
+    p = norm(X_1,'fro').^2 + g_2*norm(X_2(:),1) + g_3*norm(svd(X_3),1);
+end

@@ -4,6 +4,8 @@ By Huahua Wang, the University of Minnesota, twin cities
 
 #include <stdio.h>
 #include "badmm_kernel.cuh"
+#include <thrust/device_ptr.h>
+#include <thrust/fill.h>
 #include "cublas.h"
 #include <math.h>
 
@@ -44,7 +46,7 @@ typedef struct BADMM_massTrans
 
     float g2;
     float g3;
-    
+
     int print_step;
 
     bool SAVEFILE;
@@ -60,8 +62,7 @@ void gpuBADMM_MT( BADMM_massTrans* &badmm_mt, ADMM_para* &badmmpara, GPUInfo* gp
 {
     float *X_1, *X_2, *X_3, *U, *B;     // host (boyd code)
 
-    float *d_A, *d_X_1, *d_X_2, *d_X_3, *d_U, *d_B;     // device
-
+    float *d_A, *d_X_1, *d_X_2, *d_X_3, *d_U, *d_B, *d_z, *d_z_old, *d_Xmean, *d_X;     // device
 
     float *z;             // for stopping condition
 
@@ -75,19 +76,20 @@ void gpuBADMM_MT( BADMM_massTrans* &badmm_mt, ADMM_para* &badmmpara, GPUInfo* gp
     N = badmm_mt->N;
 
     unsigned long int size = m*n;
+    unsigned float fill_value = 0.0f;
 
-    // initialize host matrix
-    X_1 = new float[size];
-    X_2 = new float[size];
-    X_3 = new float[size];
-    U = new float[size];
-    B = new float[size];
-    z = new float[size*N];
+    // initialize host matrix, probably not required ?
+    // X_1 = new float[size];
+    // X_2 = new float[size];
+    // X_3 = new float[size];
+    // U = new float[size];
+    // B = new float[size];
+    // z = new float[size*N];
 
-    matInit(X_1,size,0.0);
-    matInit(X_2,size,0.0);
-    matInit(X_3,size,0.0);
-    matInit(Z,size,1.0/n);
+    // matInit(X_1,size,0.0);
+    // matInit(X_2,size,0.0);
+    // matInit(X_3,size,0.0);
+    // matInit(z,size,1.0/n);
     matInit(Y,size,0.0);
 
     // local variables below for updates
@@ -98,26 +100,54 @@ void gpuBADMM_MT( BADMM_massTrans* &badmm_mt, ADMM_para* &badmmpara, GPUInfo* gp
     // badmm_mt->g2 = 0.15 * g2_max;
     // badmm_mt->g3 = 0.15 * g3_max;
     // Let's hard code correct values from boyd for now
-    badmm_mt->g2 = 0.14999999999; 
+
+    badmm_mt->g2 = 0.14999999999;
     badmm_mt->g3 = 206.356410537;
 
     // GPU matrix
     cudaMalloc(&d_A, size*sizeof(float));
+    cudaMalloc(&d_X, N*size*sizeof(float));
     cudaMalloc(&d_X_1, size*sizeof(float));
     cudaMalloc(&d_X_2, size*sizeof(float));
     cudaMalloc(&d_X_3, size*sizeof(float));
     cudaMalloc(&d_U, size*sizeof(float));
     cudaMalloc(&d_B, size*sizeof(float));
+    cudaMalloc(&d_z, N*size*sizeof(float));
+    cudaMalloc(&d_z_old, N*size*sizeof(float));
+    cudaMalloc(&d_Xmean, size*sizeof(float));
 
     printf("Copying data from CPU to GPU ...\n");
 
     // copy to GPU
     cudaMemcpy(d_A, badmm_mt->A, sizeof(float)*size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_X_1, X_1, sizeof(float)*size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_X_2, X_2, sizeof(float)*size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_X_3, X_3, sizeof(float)*size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_U, U, sizeof(float)*size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, B, sizeof(float)*size, cudaMemcpyHostToDevice);
+    // cudaMemcpy(d_X_1, X_1, sizeof(float)*size, cudaMemcpyHostToDevice);
+    // cudaMemcpy(d_X_2, X_2, sizeof(float)*size, cudaMemcpyHostToDevice);
+    // cudaMemcpy(d_X_3, X_3, sizeof(float)*size, cudaMemcpyHostToDevice);
+
+    // direct device allocation
+    // this should be done on device kernel directly.
+
+    thrust::device_ptr<float> dev_ptr_X1(d_X_1);
+    thrust::device_ptr<float> dev_ptr_X2(d_X_2);
+    thrust::device_ptr<float> dev_ptr_X3(d_X_3);
+    thrust::device_ptr<float> dev_ptr_U(d_U);
+    thrust::device_ptr<float> dev_ptr_B(d_B);
+    thrust::device_ptr<float> dev_ptr_z(d_z);
+    thrust::device_ptr<float> dev_ptr_z_old(d_z_old);
+    thrust::device_ptr<float> dev_ptr_Xmean(d_Xmean);
+    thrust::device_ptr<float> dev_ptr_X(d_X);
+
+
+    thrust::fill(dev_ptr_X1, dev_ptr_X1 + size, fill_value);
+    thrust::fill(dev_ptr_X2, dev_ptr_X2 + size, fill_value);
+    thrust::fill(dev_ptr_X3, dev_ptr_X3 + size, fill_value);
+    thrust::fill(dev_ptr_U, dev_ptr_U + size, fill_value);
+    thrust::fill(dev_ptr_B, dev_ptr_B + size, fill_value);
+    thrust::fill(dev_ptr_z, dev_ptr_z + size, fill_value);
+    thrust::fill(dev_ptr_z_old, dev_ptr_z_old + size, fill_value);
+    thrust::fill(dev_ptr_Xmean, dev_ptr_Xmean + size, fill_value);
+    thrust::fill(dev_ptr_X, dev_ptr_X + size*N, fill_value);
+
 
 
 
@@ -182,16 +212,58 @@ void gpuBADMM_MT( BADMM_massTrans* &badmm_mt, ADMM_para* &badmmpara, GPUInfo* gp
     for ( iter = 0; iter < badmmpara->MAX_ITER; iter++ )
     {
         // X update
-        cublasScopy(size,d_X,1,d_Xold,1);
-        xexp<<<n_blocks,block_size>>>( d_X, d_C, d_Y, d_Z, size);
-        cublasSgemv( 'T',n,m, 1.0,d_X,n,col_ones,1, 0,d_rowSum,1);  // fortran, column-major
-        if (badmm_mt->a)
-            rowNorm_a<<<n_blocks,block_size>>>(d_X, d_rowSum, d_a, size, n);
-        else
-            rowNorm<<<n_blocks,block_size>>>(d_X, d_rowSum, size, n);
+        cublasScopy(size, d_X_1, 1, d_X_1_old, 1);
+        cublasScopy(size, d_X_2, 1, d_X_2_old, 1);
+        cublasScopy(size, d_X_3, 1, d_X_3_old, 1);
+
+        // update B here as in admm boyd
+        // can call another kernel to get the average of d_Xi's first and then send the result to B_update
+        Mean_Xs<<<n_blocks, block_size>>>(d_Xmean, d_X_1, d_X_2, d_X_3, size);
+
+        B_update<<<n_blocks, block_size>>>(d_B, d_Xmean, badmm_mt->N, d_A, d_U, size);
+
+        //xexp<<<n_blocks,block_size>>>( d_X, d_C, d_Y, d_Z, size);
+        // use cublas ?
+        // matrix addition/subtraction is faster on CPU than on GPU. Do this on CPU
+        // const float alpha = -1.0f;
+        // cublasHandle_t handle;
+        // cublasCreate(&handle);
+        //
+        // cublasSaxpy(h, size, &alpha, I, 1, A, 1);
+        // cublasSscal( size, 1.0/(1 + badmmpara->lambda), (d_X_1 - d_B), 1);
+        //
+        // modify and call matsub here
+        X1_update<<<n_blocks, block_size>>>(d_X_1, d_B, badmm_para->lambda,  size);
+
+        // X_2 = prox_l1(X_2 - B, lambda*g2);
+        X2_update<<<n_blocks, block_size>>>(d_X_2, d_B, badmm_para->lambda * badmm_para->g2, size );
+
+        // X3_update<<<n_blocks, block_size>>>(d_X_3, badmm_para->lambda, B);
+
+        // Concat all the X_i's to X for termination checks
+        concat_X<<<n_blocks, block_size>>>(d_X, d_X_1, d_X_2, d_X_3, badmm_mt->N, size);
+
+        cublasScopy(size, d_z_old, 1, d_z, 1);
+
+        // % diagnostics, reporting, termination checks
+        // matlab code continue here.
+        // // matric vector multiplication, probably not required.
+        // cublasSgemv( 'T',n,m, 1.0,d_X,n,col_ones,1, 0,d_rowSum,1);  // fortran, column-major
+        // if (badmm_mt->a)
+        //     rowNorm_a<<<n_blocks,block_size>>>(d_X, d_rowSum, d_a, size, n);
+        // else
+        //     rowNorm<<<n_blocks,block_size>>>(d_X, d_rowSum, size, n);
 
         // Z update
-        zexp<<<n_blocks,block_size>>>( d_Z, d_X, d_Y, size);
+        // this line also uses average of the three Xis,
+        // change this to cuda code
+        // z = x + repmat(-avg(X_1, X_2, X_3) + A./N, 1, N);
+
+        //zexp<<<n_blocks,block_size>>>( d_Z, d_X, d_Y, size);
+
+        // U - update
+        cublasScopy(size, d_U, 1, d_B, 1);
+        // matrix vector multiplication
         cublasSgemv('N',n,m, 1.0,d_Z,n,row_ones,1, 0.0,d_colSum,1);
         if (badmm_mt->b)
             colNorm_b<<<n_blocks,block_size>>>(d_Z, d_colSum, d_b, size, n);
@@ -340,7 +412,7 @@ int main(const int argc, const char **argv)
     fread(Asize,sizeof(int),2, f);
     badmm_mt->m = Asize[0];
     badmm_mt->n = Asize[1];
-    badmm_mt->N = 3; 
+    badmm_mt->N = 3;
     size = badmm_mt->m*badmm_mt->n;
     badmm_mt->A = new float[size];
     fread (badmm_mt->A,sizeof(float),size,f);

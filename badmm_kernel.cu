@@ -75,13 +75,13 @@ __global__ void dual( float* err, float* Y, float* X, float* Z, unsigned int siz
 //    __syncthreads();
 }
 
-__global__ void matsub( float* X, float* Y, unsigned int size)
+__global__ void matsub( float* temp, float* X, float* Y, unsigned int size)
 {
     const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int stride = blockDim.x * gridDim.x;
 
     for (unsigned int i = idx; i < size; i += stride) {
-        X[i] -= Y[i];
+        temp[i]=  X[i[ -Y[i];
     }
 }
 
@@ -192,11 +192,13 @@ __global__ void X1_update( float* d_X_1, float* d_B, float lambda,  unsigned int
     }
 }
 // this is prox_l1 of X2 , this can be used to update X3, with necessary updates.
-__global__ void X2_update( float* d_X_2, float* B, float lambda_g2, unsigned int size )
+__global__ void X2_update( float* d_X_2, float* d_B, float lambda_g2, unsigned int size )
 {
     const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int stride = blockDim.x * gridDim.x;
     for (unsigned long int i = idx; i < size; i += stride) {
+        if( d_B != NULL )
+            d_B[i] = 0.0f;
         float temp = (float)(d_X_2[i] - d_B[i]);
         d_X_2[i] = ( (float)(temp -lambda_g2) < 0 ? 0 : (temp -lambda_g2) ) - (float)(-temp -lambda_g2) < 0 ? 0 : (-temp -lambda_g2) );
     }
@@ -205,9 +207,18 @@ __global__ void X2_update( float* d_X_2, float* B, float lambda_g2, unsigned int
 __global__ void concat_X( float* d_X, float* d_X1, float* d_X2, float*  d_X3, int N,  unsigned int size )
 {
     const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
     const unsigned int stride = blockDim.x * gridDim.x;
+
     for (unsigned long int i = idx; i < size*N; i += stride) {
         d_X[i] = (i< size) ? d_X_1[i] : (i>=size && i < size*2) ? d_X_2[i-size] : d_X_3[i-2*size] ;
+    }
+}
+// svd alag se calculate karna call the prox_l1 then
+__global__ void X3_update( float* d_X_3_Minus_B, float* d_svd_U, float* d_svd_S, float* d_svd_VH, unsigned int size )
+{
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int stride = blockDim.x * gridDim.x;
+    for (unsigned long int i = idx; i < size; i += stride) {
+        temp[i] = (float)(d_X_3[i] - d_B[i]);
     }
 }

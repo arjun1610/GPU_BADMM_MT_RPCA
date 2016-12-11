@@ -62,7 +62,7 @@ void gpuBADMM_MT( BADMM_massTrans* &badmm_mt, ADMM_para* &badmmpara, GPUInfo* gp
 {
     float *X_1, *X_2, *X_3, *U, *B;     // host (boyd code)
 
-    float *d_A, *d_X_1, *d_X_2, *d_X_3, *d_U, *d_B, *d_z, *d_z_old, *d_Xmean, *d_X;     // device
+    float *d_A, *d_X_1, *d_X_2, *d_X_3, *d_U, *d_B, *d_z, *d_z_old, *d_Xmean, *d_X, *d_svd_U, *d_svd_S, *d_svd_VH, *d_temp ;     // device
 
     float *z;             // for stopping condition
 
@@ -116,6 +116,11 @@ void gpuBADMM_MT( BADMM_massTrans* &badmm_mt, ADMM_para* &badmmpara, GPUInfo* gp
     cudaMalloc(&d_z_old, N*size*sizeof(float));
     cudaMalloc(&d_Xmean, size*sizeof(float));
 
+    cudaMalloc(&d_svd_U, m*m*sizeof(float));
+    cudaMalloc(&d_svd_S, n*sizeof(float)); \\ size of min(m,n); cublasgesvd works for m>n
+    cudaMalloc(&d_svd_VH, n*n*sizeof(float));
+    cudaMalloc(&d_temp, size*sizeof(float));
+
     printf("Copying data from CPU to GPU ...\n");
 
     // copy to GPU
@@ -137,7 +142,7 @@ void gpuBADMM_MT( BADMM_massTrans* &badmm_mt, ADMM_para* &badmmpara, GPUInfo* gp
     thrust::device_ptr<float> dev_ptr_Xmean(d_Xmean);
     thrust::device_ptr<float> dev_ptr_X(d_X);
 
-
+    // dont know if this initialization is compulsory.
     thrust::fill(dev_ptr_X1, dev_ptr_X1 + size, fill_value);
     thrust::fill(dev_ptr_X2, dev_ptr_X2 + size, fill_value);
     thrust::fill(dev_ptr_X3, dev_ptr_X3 + size, fill_value);
@@ -147,7 +152,7 @@ void gpuBADMM_MT( BADMM_massTrans* &badmm_mt, ADMM_para* &badmmpara, GPUInfo* gp
     thrust::fill(dev_ptr_z_old, dev_ptr_z_old + size, fill_value);
     thrust::fill(dev_ptr_Xmean, dev_ptr_Xmean + size, fill_value);
     thrust::fill(dev_ptr_X, dev_ptr_X + size*N, fill_value);
-
+    // if necessary add SVD matrices initialization here.
 
 
 
@@ -231,14 +236,61 @@ void gpuBADMM_MT( BADMM_massTrans* &badmm_mt, ADMM_para* &badmmpara, GPUInfo* gp
         //
         // cublasSaxpy(h, size, &alpha, I, 1, A, 1);
         // cublasSscal( size, 1.0/(1 + badmmpara->lambda), (d_X_1 - d_B), 1);
-        //
+
         // modify and call matsub here
         X1_update<<<n_blocks, block_size>>>(d_X_1, d_B, badmm_para->lambda,  size);
 
         // X_2 = prox_l1(X_2 - B, lambda*g2);
         X2_update<<<n_blocks, block_size>>>(d_X_2, d_B, badmm_para->lambda * badmm_para->g2, size );
 
-        // X3_update<<<n_blocks, block_size>>>(d_X_3, badmm_para->lambda, B);
+        // X_3 = prox_matrix(X_3 - B, lambda*g3, @prox_l1);
+        matsub<<<n_blocks, block_size>>>(d_temp, d_X_3, d_B, size);
+
+        // svd code coming in
+        // --- CUDA solver initialization
+        int *devInfo;
+        //can do a gpuErrchk on all the cuda Mallocs
+        cudaMalloc(&devInfo, sizeof(int));
+        cusolverStatus_t stat;
+        cusolverDnHandle_t solver_handle;
+        cusolverDnCreate(&solver_handle);
+
+        stat = cusolverDnSgesvd_bufferSize(solver_handle, M, N, &work_size);
+        if(stat != CUSOLVER_STATUS_SUCCESS ) std::cout << "Initialization of cuSolver failed. \N";
+
+        float *work;
+        int work_size = 0;
+        gpuErrchk(cudaMalloc(&work, work_size * sizeof(float)));
+
+        // --- CUDA SVD execution
+        stat = cusolverDnSgesvd(solver_handle, 'A', 'A', m, n, d_temp, m, d_svd_S, d_svd_U, m, d_svd_VH, n, work, work_size, NULL, devInfo);
+        cudaDeviceSynchronize();
+
+        int devInfo_h = 0;
+        gpuErrchk(cudaMemcpy(&devInfo_h, devInfo, sizeof(int), cudaMemcpyDeviceToHost));
+        // std::cout << "devInfo = " << devInfo_h << "\n";
+
+        switch(stat){
+            case CUSOLVER_STATUS_SUCCESS:           std::cout << "SVD computation success\n";                       break;
+            case CUSOLVER_STATUS_NOT_INITIALIZED:   std::cout << "Library cuSolver not initialized correctly\n";    break;
+            case CUSOLVER_STATUS_INVALID_VALUE:     std::cout << "Invalid parameters passed\n";                     break;
+            case CUSOLVER_STATUS_INTERNAL_ERROR:    std::cout << "Internal operation failed\n";                     break;
+        }
+
+        // if (devInfo_h == 0 && stat == CUSOLVER_STATUS_SUCCESS) std::cout    << "SVD successful\n\n";
+
+        // --- Moving the results from device to host
+        // cudaMemcpy(h_S, d_S, N * sizeof(float), cudaMemcpyDeviceToHost);
+
+        // for(int i = 0; i < N; i++) std::cout << "d_S["<<i<<"] = " << h_S[i] << std::endl;
+        cusolverDnDestroy(solver_handle);
+        // X3 update here
+        // first calculate the prox_l1 // declare B as NULL here.
+        // reusing prox_l1 here
+        X2_update<<<n_blocks, block_size>>>(d_svd_S, NULL, badmm_para->lambda * badmm_para->g3, size );
+
+        // TODO-  this has to be updated 
+        X3_update<<<n_blocks, block_size>>>(d_X_3, d_svd_U, d_svd_S,  d_svd_VH, size);
 
         // Concat all the X_i's to X for termination checks
         concat_X<<<n_blocks, block_size>>>(d_X, d_X_1, d_X_2, d_X_3, badmm_mt->N, size);

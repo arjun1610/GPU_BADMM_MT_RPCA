@@ -119,6 +119,7 @@ void gpuBADMM_MT( BADMM_massTrans* &badmm_mt, ADMM_para* &badmm_para, GPUInfo* g
     float *d_A, *d_X_1, *d_X_2, *d_X_3, *d_U;
     float *d_z, *d_z_old, *d_Xmean, *d_X;
     float *d_svd_U, *d_svd_S, *d_svd_VH, *d_temp ;
+    float *d_X3chol, *d_X3_Q, *d_X3_U;
 
     unsigned int m,n,N;
     m = badmm_mt->m;
@@ -151,6 +152,10 @@ void gpuBADMM_MT( BADMM_massTrans* &badmm_mt, ADMM_para* &badmm_para, GPUInfo* g
     cudaMalloc(&d_svd_S, n*sizeof(float)); // size of min(m,n); cublasgesvd works for m>n
     cudaMalloc(&d_svd_VH, n*n*sizeof(float));
     cudaMalloc(&d_temp, size*sizeof(float));
+    cudaMalloc(&d_X3chol, n*n*sizeof(float));
+    cudaMalloc(&d_X3_Q, m*n*sizeof(float));
+
+    cudaMalloc(&d_X3_U, m*n*sizeof(float));
 
     printf("Copying data from CPU to GPU ...\n");
 
@@ -177,7 +182,7 @@ void gpuBADMM_MT( BADMM_massTrans* &badmm_mt, ADMM_para* &badmm_para, GPUInfo* g
     unsigned int block_size = size > gpu_info->MAX_BLOCK_SIZE ? gpu_info->MAX_BLOCK_SIZE : size;
     unsigned long int n_blocks = (int) (size+block_size-1)/block_size;
     if(n_blocks > gpu_info->MAX_GRID_SIZE) n_blocks = gpu_info->MAX_GRID_SIZE;
-    printf("Block size %f b_blocks %f\n", block_size, n_blocks);
+    printf("Block size %d b_blocks %d\n", block_size, n_blocks);
 
     unsigned int stride = block_size*n_blocks;
 
@@ -189,7 +194,7 @@ void gpuBADMM_MT( BADMM_massTrans* &badmm_mt, ADMM_para* &badmm_para, GPUInfo* g
     float iter_obj;
     int iter, count = 0;
     // GPU time
-    float milliseconds = 0;
+    //float milliseconds = 0;
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -224,25 +229,69 @@ void gpuBADMM_MT( BADMM_massTrans* &badmm_mt, ADMM_para* &badmm_para, GPUInfo* g
         thrust::transform(
             dp_X3, dp_X3 + size, dp_U, dp_X3, thrust::minus<float>() 
         );
+        
+        cudaEvent_t start_svd, stop_svd;
+        cudaEventCreate(&start_svd);
+        cudaEventCreate(&stop_svd);
+        cudaEventRecord(start_svd);
+
+       
+        // svd - economy version code coming in
+        cublasHandle_t handle;
+        cublasCreate(&handle);
+        
+        const float alph= 1;
+        const float bet = 0;
+        const float* alpha = &alph;
+        const float* beta = &bet;
+
+        // multiply X3.T * X3 which serves as in input to Cholesky d_In  = X3.T(200, 25344) * X3(25344, 200); m,k * k,n
+        cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, n, n, m, alpha, d_X_3, m, d_X_3, m, beta, d_X3chol, n);
+        cublasDestroy(handle);
+        //Cholesky Code coming in 
+        
+
+ 
 
         // svd code coming in
+        
         // --- CUDA solver initialization
         int *devInfo;
-        //can do a gpuErrchk on all the cuda Mallocs
-        cudaMalloc(&devInfo, sizeof(int));
+        int work_size = 0;
+        gpuErrchk(cudaMalloc(&devInfo, sizeof(int)));
+
         cusolverStatus_t stat;
         cusolverDnHandle_t solver_handle;
         cusolverDnCreate(&solver_handle);
-
-        int work_size = 0;
-        stat = cusolverDnSgesvd_bufferSize(solver_handle, m, n, &work_size);
-        if(stat != CUSOLVER_STATUS_SUCCESS ) std::cout << "Initialization of cuSolver failed. \n";
-
-        float *work;
+        
+        cusolverDnSpotrf_bufferSize(solver_handle, CUBLAS_FILL_MODE_UPPER, n, d_X3chol, n, &work_size);
+         
+        float *work;   
         gpuErrchk(cudaMalloc(&work, work_size * sizeof(float)));
 
+        cusolverDnSpotrf(solver_handle, CUBLAS_FILL_MODE_UPPER, n, d_X3chol, n, work, work_size, devInfo);
+        // Q = A * R inverse ( not inverting now due to complex code )
+        cublasHandle_t handle_Q;
+        cublasCreate(&handle_Q);
+        cublasSgemm(handle_Q, CUBLAS_OP_N, CUBLAS_OP_N, m, n, n, alpha, d_X_3, m, d_X3chol, n, beta, d_X3_Q, m);
+        cublasDestroy(handle_Q);
+
+       //svd coming in
+        cusolverStatus_t stat_svd;
+        cusolverDnHandle_t solver_handle_svd;
+        cusolverDnCreate(&solver_handle_svd);
+
+        work_size = 0;
+        
+        stat = cusolverDnSgesvd_bufferSize(solver_handle_svd, n, n, &work_size);
+        if(stat != CUSOLVER_STATUS_SUCCESS ) std::cout << "Initialization of cuSolver failed. \n";
+        
+
+        float *work_svd;
+        gpuErrchk(cudaMalloc(&work_svd, work_size * sizeof(float)));
+        
         // --- CUDA SVD execution
-        stat = cusolverDnSgesvd(solver_handle, 'A', 'A', m, n, d_X_3, m, d_svd_S, d_svd_U, m, d_svd_VH, n, work, work_size, NULL, devInfo);
+        stat = cusolverDnSgesvd(solver_handle_svd, 'A', 'A', n, n, d_X3chol, n, d_svd_S, d_svd_U, n, d_svd_VH, n, work_svd, work_size, NULL, devInfo);
         cudaDeviceSynchronize();
 
         int devInfo_h = 0;
@@ -255,7 +304,7 @@ void gpuBADMM_MT( BADMM_massTrans* &badmm_mt, ADMM_para* &badmm_para, GPUInfo* g
             case CUSOLVER_STATUS_INVALID_VALUE:     std::cout << "Invalid parameters passed\n";                     break;
             case CUSOLVER_STATUS_INTERNAL_ERROR:    std::cout << "Internal operation failed\n";                     break;
         }
-
+        
         // if (devInfo_h == 0 && stat == CUSOLVER_STATUS_SUCCESS) std::cout    << "SVD successful\n\n";
 
         // --- Moving the results from device to host
@@ -263,6 +312,25 @@ void gpuBADMM_MT( BADMM_massTrans* &badmm_mt, ADMM_para* &badmm_para, GPUInfo* g
 
         // for(int i = 0; i < N; i++) std::cout << "d_S["<<i<<"] = " << h_S[i] << std::endl;
         cusolverDnDestroy(solver_handle);
+        cusolverDnDestroy(solver_handle_svd);
+        
+        cublasHandle_t handle_U;
+        cublasCreate(&handle_U);
+        cublasSgemm(handle_U, CUBLAS_OP_N, CUBLAS_OP_N, m, n, n, alpha, d_X3_Q, m, d_svd_U, n, beta, d_X3_U, m);
+        cublasDestroy(handle_U);
+
+  
+        
+        cudaEventRecord(stop_svd);
+        cudaEventSynchronize(stop_svd);
+        
+
+        float millis = 0;
+        cudaEventElapsedTime(&millis, start_svd, stop_svd);
+        
+        printf("per svd per iteration run time : %f\n", millis);
+        
+        
         // X3 update here
         // first calculate the prox_l1 // declare B as NULL here.
         // reusing prox_l1 here
@@ -349,17 +417,19 @@ void gpuBADMM_MT( BADMM_massTrans* &badmm_mt, ADMM_para* &badmm_para, GPUInfo* g
 
         // *******************************************************
         // NON COMPILED BLOCK ENDS HERE
-        */
+    */
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("per iteration run time : %f\n", milliseconds);
+ 
     }
     // calculate primal objective value
     // dev_ptr = thrust::device_pointer_cast(d_Z);
     // iter_obj = thrust::inner_product(d_Cptr, d_Cptr+size, dev_ptr, 0.0f);
 
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&milliseconds, start, stop);
-
-    // average X+Z
+   // average X+Z
 //    cublasSaxpy (size, 1, d_Z, 1, d_X, 1);
 //    cublasSscal( size, 0.5, d_X, 1);
 
@@ -427,8 +497,8 @@ int main(const int argc, const char **argv)
 
     // read A
     sprintf(filename, "%dC.dat",dim);
-
-	printf("%s", filename);
+    // sprintf(filename, "%dC_smalltest.dat",dim);
+	printf("filename is: %s\n", filename);
 	f = fopen ( filename , "rb" );
 
     if ( f == NULL ) {
@@ -482,7 +552,7 @@ int main(const int argc, const char **argv)
     // default value
     badmm_para->lambda = 1;
     badmm_para->rho = 1.0 / badmm_para->lambda;
-    badmm_para->MAX_ITER = 100;
+    badmm_para->MAX_ITER = 200;
     badmm_para->tol = 1e-4;
     badmm_para->abstol = 1e-4;
     badmm_para->reltol = 1e-2;
